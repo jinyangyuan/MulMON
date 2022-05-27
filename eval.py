@@ -1,100 +1,56 @@
+# -*- coding: utf-8 -*-
+"""
+Training MulMON on a single GPU.
+@author: Nanbo Li
+"""
 import sys
 import os
-import random
-from attrdict import AttrDict
-import numpy as np
 import argparse
+import datetime
+import h5py
+import matplotlib.pyplot as plt
+import numpy as np
+import random
 import torch
+import torch.utils.data as utils_data
+import yaml
+from models.mulmon import MulMON
+from torch.utils.tensorboard import SummaryWriter
 
 # set project search path
 ROOT_DIR = os.path.abspath("./")
 sys.path.append(ROOT_DIR)
 
-import utils
 from config import CONFIG
-# import pdb
+from scheduler import AnnealingStepLR
+from trainer.model_trainer import ModelTrainer
+from utils import set_random_seed, load_trained_mp, ensure_dir
 
 
-# ------------------------- respecify important flags ------------------------
+# ------------------------- important specs ------------------------
 def running_cfg(cfg):
-    ###########################################
-    # Config i/o path
-    ###########################################
-    if cfg.DATA_TYPE.lower() == 'gqn_jaco':
-        image_size = [64, 64]
-        CLASSES = ['_background_', 'jaco', 'generic']
-        cfg.v_in_dim = 7
-        cfg.max_sample_views = 6
-        data_dir = cfg.DATA_ROOT
-        assert os.path.exists(data_dir)
-        # train_data_filename = os.path.join(data_dir, 'gqn_jaco', 'gqn_jaco_train.h5')
-        test_data_filename = os.path.join(data_dir, 'gqn_jaco', 'gqn_jaco_test.h5')
-        # assert os.path.isfile(train_data_filename)
-        assert os.path.isfile(test_data_filename)
-    elif cfg.DATA_TYPE.lower() == 'clevr_mv':
-        image_size = [64, 64]
-        CLASSES = ['_background_', 'cube', 'sphere', 'cylinder']
-        cfg.v_in_dim = 3
-        cfg.max_sample_views = 6
-        data_dir = cfg.DATA_ROOT
-        assert os.path.exists(data_dir)
-        # train_data_filename = os.path.join(data_dir, 'clevr_mv', 'clevr_mv_train.json')
-        test_data_filename = os.path.join(data_dir, 'clevr_mv', 'clevr_mv_test.json')
-        # assert os.path.isfile(train_data_filename)
-        assert os.path.isfile(test_data_filename)
-    elif cfg.DATA_TYPE.lower() == 'clevr_aug':
-        image_size = [64, 64]
-        CLASSES = ['_background_', 'diamond', 'duck', 'mug', 'horse', 'dolphin']
-        cfg.v_in_dim = 3
-        cfg.max_sample_views = 6
-        data_dir = cfg.DATA_ROOT
-        assert os.path.exists(data_dir)
-        # train_data_filename = os.path.join(data_dir, 'clevr_aug', 'clevr_aug_train.json')
-        test_data_filename = os.path.join(data_dir, 'clevr_aug', 'clevr_aug_test.json')
-        # assert os.path.isfile(train_data_filename)
-        assert os.path.isfile(test_data_filename)
-    # ------------------- For your customised CLEVR -----------------------
-    elif cfg.DATA_TYPE.lower() == 'your-clevr':
-        image_size = [64, 64]
-        CLASSES = ['_background_', 'xxx']
-        cfg.v_in_dim = 3
-        cfg.max_sample_views = 6
-        data_dir = cfg.DATA_ROOT
-        assert os.path.exists(data_dir)
-        # train_data_filename = os.path.join(data_dir, 'your-clevr', 'your-clevr_train.json')
-        test_data_filename = os.path.join(data_dir, 'your-clevr', 'your-clevr_test.json')
-        # assert os.path.isfile(train_data_filename)
-        assert os.path.isfile(test_data_filename)
-    # ------------------- For your customised CLEVR -----------------------
-    else:
-        raise NotImplementedError
 
     cfg.view_dim = cfg.v_in_dim
 
     # log directory
     ckpt_base = cfg.ckpt_base
-    if not os.path.exists(ckpt_base):
-        os.mkdir(ckpt_base)
+    ensure_dir(ckpt_base)
 
     # model savedir
     check_dir = os.path.join(ckpt_base, '{}_log/'.format(cfg.arch))
-    assert os.path.exists(check_dir)
-    # os.mkdir(check_dir)
+    ensure_dir(check_dir)
 
-    # output prediction dir
-    out_dir = os.path.join(check_dir, cfg.output_dir_name)
-    if not os.path.exists(out_dir):
-        os.mkdir(out_dir)
-
-    # saved model dir
+    # generated sample dir
     save_dir = os.path.join(check_dir, 'saved_models/')
-    if not os.path.exists(save_dir):
-        os.mkdir(save_dir)
+    ensure_dir(save_dir)
+
+    # visualise training epochs
+    vis_train_dir = os.path.join(check_dir, 'vis_training/')
+    ensure_dir(vis_train_dir)
 
     # generated sample dir  (for testing generation)
-    generated_dir = os.path.join(check_dir, 'generated')
-    if not os.path.exists(generated_dir):
-        os.mkdir(generated_dir)
+    generated_dir = os.path.join(check_dir, 'generated/')
+    ensure_dir(generated_dir)
 
     if cfg.resume_path is not None:
         assert os.path.isfile(cfg.resume_path)
@@ -104,22 +60,28 @@ def running_cfg(cfg):
         assert os.path.isfile(resume_path)
         cfg.resume_path = resume_path
 
-    cfg.DATA_DIR = data_dir
-    cfg.test_data_filename = test_data_filename
     cfg.check_dir = check_dir
     cfg.save_dir = save_dir
+    cfg.vis_train_dir = vis_train_dir
     cfg.generated_dir = generated_dir
-    cfg.output_dir = out_dir
 
-    cfg.image_size = image_size
-    cfg.CLASSES = CLASSES
-    cfg.num_classes = len(CLASSES)
+    cfg.image_size = [64, 64]
 
     return cfg
 
 
 # ---------------------------- main function -----------------------------
-def run_evaluation(CFG):
+def get_trainable_params(model):
+    params_to_update = []
+    print('trainable parameters:')
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            print("\t", name)
+            params_to_update.append(param)
+    return params_to_update
+
+
+def train(gpu_id, CFG):
     if 'GQN' in CFG.arch:
         from models.baseline_gqn import GQN as ScnModel
         print(" --- Arch: GQN ---")
@@ -132,191 +94,224 @@ def run_evaluation(CFG):
     else:
         raise NotImplementedError
 
-    # --- model to be evaluated ---
+    # Create the model
     scn_model = ScnModel(CFG)
-    torch.cuda.set_device(CFG.gpu)
-
-    if CFG.seed is None:
-        CFG.seed = random.randint(0, 1000000)
-    utils.set_random_seed(CFG.seed)
-
     if CFG.resume_epoch is not None:
-        state_dict = utils.load_trained_mp(CFG.resume_path)
+        state_dict = load_trained_mp(CFG.resume_path)
         scn_model.load_state_dict(state_dict, strict=True)
-    scn_model.cuda(CFG.gpu)
-    scn_model.eval()
+    params_to_update = get_trainable_params(scn_model)
 
-    if 'gqn' in CFG.DATA_TYPE.lower():
+    if CFG.optimiser == 'RMSprop':
+        optimiser = torch.optim.RMSprop(params_to_update,
+                                        lr=CFG.lr_rate,
+                                        weight_decay=CFG.weight_decay)
+        lr_scheduler = None
+    else:
+        optimiser = torch.optim.Adam(params_to_update,
+                                     lr=CFG.lr_rate,
+                                     weight_decay=CFG.weight_decay)
+        lr_scheduler = AnnealingStepLR(optimiser, mu_i=CFG.lr_rate, mu_f=0.1*CFG.lr_rate, n=1e6)
+
+    if 'gqn' in CFG.DATA_TYPE:
         from data_loader.getGqnH5 import DataLoader
-    elif 'clevr' in CFG.DATA_TYPE.lower():
+    elif 'clevr' in CFG.DATA_TYPE:
         from data_loader.getClevrMV import DataLoader
     else:
         raise NotImplementedError
 
-    eval_dataloader = DataLoader(CFG.DATA_ROOT,
-                                 CFG.test_data_filename,
-                                 batch_size=CFG.batch_size,
-                                 shuffle=True,
-                                 use_bg=CFG.use_bg)
+    # get data Loader
+    train_dl = DataLoader(CFG.DATA_ROOT,
+                          CFG.train_data_filename,
+                          batch_size=CFG.batch_size,
+                          shuffle=True,
+                          num_slots=CFG.num_slots,
+                          use_bg=True)
+    val_dl = DataLoader(CFG.DATA_ROOT,
+                        CFG.test_data_filename,
+                        batch_size=CFG.batch_size,
+                        shuffle=True,
+                        num_slots=CFG.num_slots,
+                        use_bg=True)
 
-    if 'gqn' not in CFG.DATA_TYPE.lower():
-        scene_meta_info = utils.read_json(CFG.test_data_filename)['scenes']
+    if CFG.seed is None:
+        CFG.seed = random.randint(0, 1000000)
+    set_random_seed(CFG.seed)
 
-    vis_eval_dir = CFG.generated_dir
-    if not os.path.exists(vis_eval_dir):
-        os.mkdir(vis_eval_dir)
+    trainer = ModelTrainer(
+        model=scn_model,
+        loss=None,
+        metrics=None,
+        optimizer=optimiser,
+        step_per_epoch=CFG.step_per_epoch,
+        config=CFG,
+        train_data_loader=train_dl,
+        valid_data_loader=val_dl,
+        device=gpu_id,
+        lr_scheduler=lr_scheduler
+    )
+    # Start training session
+    trainer.train()
 
-    # --- dict that stores all the evaluation results ---
-    EVAL_RESULT = AttrDict()
-    obs_rec_record = []
-    qry_obs_record = []
-    obs_seg_miou = []
-    qry_seg_miou = []
-    GT_latents = []
 
-    # --- running on ---
-    count_total_samples = 0
-    num_batches = min(CFG.test_batch, len(eval_dataloader))
-    for batch_id, (images, targets) in enumerate(eval_dataloader):
-        if batch_id >= num_batches:
-            break
-        # images, targets = next(iter(eval_dataloader))
-        images = list(image.cuda(CFG.gpu).detach() for image in images)
-        targets = [{k: v.cuda(CFG.gpu).detach() for k, v in t.items()} for t in targets]
+class Dataset(utils_data.Dataset):
 
-        if batch_id >= CFG.vis_batch:
-            vis_eval_dir = None
-        print("  predicting on batch: {}/{}".format(batch_id+1, num_batches))
+    def __init__(self, data, data_view):
+        super(Dataset, self).__init__()
+        self.images = torch.tensor(data['image'])
+        self.segments = torch.tensor(data['segment'])
+        self.overlaps = torch.tensor(data['overlap'])
+        self.viewpoints = torch.tensor(data_view)
+        if self.images.ndim == 4 and self.segments.ndim == 3 and self.overlaps.ndim == 3:
+            self.images = self.images[:, None]
+            self.segments = self.segments[:, None]
+            self.overlaps = self.overlaps[:, None]
+            self.viewpoints = self.viewpoints[:, None]
+        assert self.images.ndim == 5
+        assert self.segments.ndim == 4
+        assert self.overlaps.ndim == 4
+        assert self.viewpoints.ndim == 3
 
-        test_out = scn_model.predict(images, targets,
-                                     save_sample_to=vis_eval_dir,
-                                     save_start_id=count_total_samples,
-                                     vis_train=False,
-                                     vis_uncertainty=False)
+    def __getitem__(self, idx):
+        image = self.images[idx]
+        segment = self.segments[idx]
+        overlap = self.overlaps[idx]
+        viewpoint = self.viewpoints[idx]
+        data = {'image': image, 'segment': segment, 'overlap': overlap, 'viewpoint': viewpoint}
+        return data
 
-        B = len(images)
-        V = targets[0]['view_points'].shape[0]
-        num_obs = CFG.num_vq_show
+    def __len__(self):
+        return self.images.shape[0]
 
-        # ----- viewpoints (ids) to be evaluated at -----
-        # use these lists on GT only, as the output variables are specified by these indices already
-        obs_view_ids, qry_view_ids = test_out['obs_views'], test_out['query_views']
-        num_qry = len(qry_view_ids)
-        assert num_obs==len(obs_view_ids)
 
-        # ----- Task performance -----
-        if CFG.eval_recon:
-            x_obs, x_rec = test_out['x_images'][:, :num_obs], test_out['x_recon'][:, :num_obs]
-            rmse_out = np.sqrt(np.sum((x_obs - x_rec)**2, axis=-3).reshape([B, -1]).mean(-1))
-            obs_rec_record.append(rmse_out)
+def get_data_loaders(config):
+    image_shape = None
+    datasets = {}
+    with h5py.File(config['path_data'], 'r', libver='latest', swmr=True) as f, \
+            h5py.File(config['path_viewpoint'], 'r', libver='latest', swmr=True) as f_view:
+        phase_list = [*f.keys()]
+        if not config['train']:
+            phase_list = [val for val in phase_list if val not in ['train', 'valid']]
+        index_sel = slice(config['batch_size']) if config['debug'] else ()
+        for phase in phase_list:
+            data = {key: f[phase][key][index_sel] for key in f[phase] if key not in ['layers', 'masks']}
+            data['image'] = np.moveaxis(data['image'], -1, -3)
+            if image_shape is None:
+                image_shape = data['image'].shape[-3:]
+            else:
+                assert image_shape == data['image'].shape[-3:]
+            data_view = f_view[phase]['viewpoint'][index_sel]
+            datasets[phase] = Dataset(data, data_view)
+    if 'train' in datasets and 'valid' not in datasets:
+        datasets['valid'] = datasets['train']
+    data_loaders = {}
+    for key, val in datasets.items():
+        data_loaders[key] = utils_data.DataLoader(
+            val,
+            batch_size=config['batch_size'],
+            num_workers=1,
+            shuffle=(key == 'train'),
+            drop_last=(key == 'train'),
+            pin_memory=True,
+        )
+    return data_loaders, image_shape
 
-        if CFG.eval_qry_obs:
-            xq_gt, xq_pred = test_out['x_images'][:, num_obs:], test_out['x_recon'][:, num_obs:]
-            rmse_out = np.sqrt(np.sum((xq_gt - xq_pred) ** 2, axis=-3).reshape([B, -1]).mean(-1))
-            qry_obs_record.append(rmse_out)
 
-        if CFG.eval_seg:
-            masks_gt = torch.stack([tar['masks'].squeeze(1) for tar in targets], dim=0).permute(0, 1, 4, 2, 3)
-            m_gt, m_pred = masks_gt[:, obs_view_ids], \
-                                torch.from_numpy(test_out['hiers'][:, :num_obs]).to(masks_gt.device)
-            num_comps = np.asarray(list([tar['num_comps'].item()] * num_obs for tar in targets), dtype='uint8')
+def add_scalars(writer, metrics, losses, step, phase):
+    for key, val in metrics.items():
+        writer.add_scalar('{}/metric_{}'.format(phase, key), val, global_step=step)
+    for key, val in losses.items():
+        writer.add_scalar('{}/loss_{}'.format(phase, key), val, global_step=step)
+    return
 
-            # Matching: find the best pred-gt object pairs as we don't enforce any permutation in the predictions
-            _, match_list = utils.match_or_compute_segmentation_iou(m_pred, m_gt, num_comps,
-                                                                    threshold=1.0)
-            # compute mIoU using the match we find
-            obs_seg_miou += utils.match_or_compute_segmentation_iou(m_pred, m_gt, num_comps,
-                                                                    match_list=match_list, threshold=1.0)[0]
 
-        if CFG.eval_qry_seg:
-            masks_gt = torch.stack([tar['masks'].squeeze(1) for tar in targets], dim=0).permute(0, 1, 4, 2, 3)
-            m_gt, m_pred = masks_gt[:, qry_view_ids], \
-                           torch.from_numpy(test_out['hiers'][:, num_obs:]).to(masks_gt.device)
-            num_comps = np.asarray(list([tar['num_comps'].item()] * num_qry for tar in targets), dtype='uint8')
+def compute_overview(config, results, dpi=100):
+    def convert_image(image):
+        image = np.moveaxis(image, 0, 2)
+        if image.shape[2] == 1:
+            image = np.repeat(image, 3, axis=2)
+        return image
+    def plot_image(ax, image, xlabel=None, ylabel=None, color=None):
+        plot = ax.imshow(image, interpolation='bilinear')
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_xlabel(xlabel, color='k' if color is None else color, fontfamily='monospace') if xlabel else None
+        ax.set_ylabel(ylabel, color='k' if color is None else color, fontfamily='monospace') if ylabel else None
+        ax.xaxis.set_label_position('top')
+        return plot
+    def get_overview(fig_idx):
+        image = results_sel['image'][fig_idx]
+        recon = results_sel['recon'][fig_idx]
+        apc = results_sel['apc'][fig_idx]
+        mask = results_sel['mask'][fig_idx]
+        pres = results_sel['pres'][fig_idx]
+        num_views, num_slots = apc.shape[:2]
+        rows, cols = 2 * num_views, num_slots + 1
+        fig, axes = plt.subplots(rows, cols, figsize=(cols, rows + 0.2), dpi=dpi)
+        for idx_v in range(num_views):
+            plot_image(axes[idx_v * 2, 0], convert_image(image[idx_v]), xlabel='scene' if idx_v == 0 else None)
+            plot_image(axes[idx_v * 2 + 1, 0], convert_image(recon[idx_v]))
+            for idx_s in range(num_slots):
+                xlabel = 'obj_{}'.format(idx_s) if idx_s < num_slots - 1 else 'back'
+                xlabel = xlabel if idx_v == 0 else None
+                color = [1.0, 0.5, 0.0] if pres[idx_s] >= 128 else [0.0, 0.5, 1.0]
+                plot_image(axes[idx_v * 2, idx_s + 1], convert_image(apc[idx_v, idx_s]), xlabel=xlabel, color=color)
+                plot_image(axes[idx_v * 2 + 1, idx_s + 1], convert_image(mask[idx_v, idx_s]))
+        fig.tight_layout(pad=0)
+        fig.canvas.draw()
+        width, height = fig.canvas.get_width_height()
+        out = np.frombuffer(fig.canvas.tostring_rgb(), dtype='uint8').reshape(height, width, -1)
+        plt.close(fig)
+        return out
+    summ_image_count = min(config['summ_image_count'], config['batch_size'])
+    results_sel = {key: val[:summ_image_count].data.cpu().numpy() for key, val in results.items()}
+    overview_list = [get_overview(idx) for idx in range(summ_image_count)]
+    overview = np.concatenate(overview_list, axis=0)
+    overview = np.moveaxis(overview, 2, 0)
+    return overview
 
-            # Matching: find the best pred-gt object pairs as we don't enforce any permutation in the predictions
-            _, match_list = utils.match_or_compute_segmentation_iou(m_pred, m_gt, num_comps,
-                                                                    threshold=1.0)
-            # compute mIoU using the match we find
-            qry_seg_miou += utils.match_or_compute_segmentation_iou(m_pred, m_gt, num_comps,
-                                                                    match_list=match_list, threshold=1.0)[0]
 
-        # ----- Save latents for disentanglement analysis -----
-        if batch_id < CFG.analyse_batch and CFG.eval_dist:
-            # find matches
-            assert num_obs == V, "Use all available observations for disentanglement evaluation"
-            assert CFG.batch_size == 1, "Must set batch size to 1 for disentanglement evaluation"
-            assert "clevr" in CFG.DATA_TYPE.lower()
-            masks_gt = torch.stack([tar['masks'].squeeze(1) for tar in targets], dim=0).permute(0, 1, 4, 2, 3)
-            m_gt, m_pred = masks_gt[:, obs_view_ids], \
-                           torch.from_numpy(test_out['hiers'][:, :num_obs]).to(masks_gt.device)
-            num_comps = np.asarray(list([tar['num_comps'].item()] * num_obs for tar in targets), dtype='uint8')
-
-            # Matching: find the best pred-gt object pairs as we don't enforce any permutation in the predictions
-            _, match_list = utils.match_or_compute_segmentation_iou(m_pred, m_gt, num_comps,
-                                                                    threshold=1.0)
-
-            z_2d = test_out['2d_latents']
-            z_3d = test_out['3d_latents']
-            scene_meta_info = utils.read_json(CFG.test_data_filename)['scenes']
-            # we need remove background reps as it is less important
-            z_2d = list(z_2d[0, vid, match_list[vid][1:]] for vid in range(V))
-            z_3d = list(z_3d[0, vid, match_list[vid][1:]] for vid in range(V))  # delete background
-            g_latent = utils.save_latents_for_eval(z_v_out=z_2d,
-                                                   z_out=z_3d,
-                                                   scn_indices=test_out['scene_indices'],
-                                                   qry_views=obs_view_ids,
-                                                   gt_scenes_meta=scene_meta_info,
-                                                   out_dir=os.path.join(CFG.output_dir, 'latents'),
-                                                   save_count=count_total_samples)
-            GT_latents += g_latent
-        count_total_samples += len(images)
-
-    if CFG.eval_recon:
-        rmse_record = np.concatenate(obs_rec_record, axis=0).mean()
-        EVAL_RESULT['rmse_rec'] = rmse_record.item()
-
-    if CFG.eval_qry_obs:
-        qry_obs_record = np.concatenate(qry_obs_record, axis=0).mean()
-        EVAL_RESULT['rmse_qry'] = qry_obs_record.item()
-
-    if CFG.eval_seg:
-        EVAL_RESULT['miou_seg'] = np.stack(obs_seg_miou, axis=0).mean().item()
-
-    if CFG.eval_qry_seg:
-        EVAL_RESULT['miou_qry'] = np.stack(qry_seg_miou, axis=0).mean().item()
-
-    if len(GT_latents) > 0:
-        utils.write_json({'scene_meta': GT_latents}, os.path.join(CFG.output_dir, 'gt_latent_meta.json'))
-
-    utils.write_json(EVAL_RESULT, os.path.join(CFG.check_dir, 'eval_{}.json'.format(CFG.DATA_TYPE)))
-
-    return EVAL_RESULT
+def add_overviews(config, writer, results, step, phase):
+    overview = compute_overview(config, results)
+    writer.add_image(phase, overview, global_step=step)
+    return
 
 
 def main(cfg):
     parser = argparse.ArgumentParser()
+    parser.add_argument('--path_config')
+    parser.add_argument('--path_data')
+    parser.add_argument('--path_viewpoint')
+    parser.add_argument('--folder_log')
+    parser.add_argument('--folder_out')
+    parser.add_argument('--timestamp')
+    parser.add_argument('--num_tests', type=int)
+    parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--train', action='store_true')
+    parser.add_argument('--resume', action='store_true')
+    parser.add_argument('--use_timestamp', action='store_true')
+    parser.add_argument('--file_ckpt', default='ckpt.pth')
+    parser.add_argument('--file_model', default='model.pth')
     parser.add_argument('--arch', type=str, default='ScnModel',
-                        help="architecture name or model nickname")
-    parser.add_argument('--datatype', type=str, default='clevr_mv',
-                        help="one of [clevr_mv, clevr_aug, gqn-jaco]")
-    parser.add_argument('--batch_size', default=16, type=int, metavar='N',
-                        help='number of data samples of a minibatch')
-    parser.add_argument('--test_batch', default=10000, type=int, metavar='N',
-                        help='run model on only the first [N] batch of the data set')
-    parser.add_argument('--vis_batch', default=1, type=int, metavar='N',
-                        help='visualise only the first [N] batch and save to the generated dir')
-    parser.add_argument('--analyse_batch', default=1, type=int, metavar='N',
-                        help='save and analyse only the first [N] batch latent codes')
-    parser.add_argument('--work_mode', type=str, default='testing', help="model's working mode")
-    parser.add_argument('--resume_epoch', default=500, type=int, metavar='N',
+                        help="model name")
+    parser.add_argument('--datatype', type=str, default='clevr',
+                        help="one of [gqn_jaco, clevr_mv, clevr_aug]")
+    parser.add_argument('--epochs', default=1000, type=int, metavar='N', help='number of total epochs to run')
+    parser.add_argument('--step_per_epoch', default=0, type=int, metavar='N', help='number of total epochs to run')
+    parser.add_argument('--batch_size', default=4, type=int, metavar='N', help='number of data samples of a minibatch')
+    parser.add_argument('--work_mode', type=str, default='training', help="model's working mode")
+    parser.add_argument('--optimiser', type=str, default='Adam', help="help= one of [Adam, RMSprop]")
+    parser.add_argument('--resume_epoch', default=None, type=int, metavar='N',
                         help='resume weights from [N]th epochs')
-    parser.add_argument('--output_name', default=None, type=str,
-                        help='save the prediction output to the specified dir')
-    parser.add_argument('--gpu', default=0, type=int, help='specify id of gpu to use')
-    parser.add_argument('--seed', default=0, type=int, help='random seed')
 
-    # Model spec
+    parser.add_argument('--nodes', default=1, type=int, metavar='N')
+    parser.add_argument('--gpus', default=1, type=int, help='number of gpus per node')
+    parser.add_argument('--nrank', default=0, type=int, help='ranking within the nodes')
+    parser.add_argument('--gpu_start', default=0, type=int, help='first gpu indicator, default using 0 as the start')
+    parser.add_argument('--master_port', default='8888', type=str, help='used for rank0 communication with others')
+
+    parser.add_argument('--seed', default=0, type=int, help='random seed')
+    parser.add_argument('--lr_rate', default=1e-4, type=float, help='learning rate')
+
     parser.add_argument('--num_slots', default=7, type=int, help='(maximum) number of component slots')
     parser.add_argument('--temperature', default=0.0, type=float,
                         help='spatial scheduler increase rate, the hotter the faster coeff grows')
@@ -326,58 +321,45 @@ def main(cfg):
     parser.add_argument('--max_sample_views', default=5, type=int, help='maximum allowed #views for scene learning')
     parser.add_argument('--num_vq_show', default=5, type=int, help='#views selected for visualisation')
     parser.add_argument('--pixel_sigma', default=0.1, type=float, help='loss strength item')
-    parser.add_argument('--num_mc_samples', default=10, type=int, help='monte carlo samples for uncertainty estimation')
     parser.add_argument('--kl_latent', default=1.0, type=float, help='loss strength item')
     parser.add_argument('--kl_spatial', default=1.0, type=float, help='loss strength item')
     parser.add_argument('--exp_attention', default=1.0, type=float, help='loss strength item')
     parser.add_argument('--query_nll', default=1.0, type=float, help='loss strength item')
     parser.add_argument('--exp_nll', default=1.0, type=float, help='loss strength item')
 
-    parser.add_argument("--use_bg", default=False, help="treat background also an object",
-                        action="store_true")
-    parser.add_argument("--eval_all", default=False, help="evaluate model with all the metrics",
-                        action="store_true")
-    parser.add_argument("--eval_recon", default=False, help="perform reconstruction evaluation",
-                        action="store_true")
-    parser.add_argument("--eval_seg", default=False, help="perform segmentation evaluation",
-                        action="store_true")
-    parser.add_argument("--eval_qry_obs", default=False, help="perform queried Obs.Pred. evaluation",
-                        action="store_true")
-    parser.add_argument("--eval_qry_seg", default=False, help="perform queried Seg.Pred. evaluation",
-                        action="store_true")
-    parser.add_argument("--eval_dist", default=False, help="perform disentanglement evaluation",
-                        action="store_true")
+    parser.add_argument("--use_mask", help="use gt mask to by pass the segmentation phase",
+                        action="store_true", default=False)
+    parser.add_argument("--use_bg", help="treat background as an object",
+                        action="store_true", default=False)
 
-    parser.add_argument("-i", '--input_dir', required=True, help="path to the input data for the model to read")
-    parser.add_argument("-o", '--output_dir', required=True, help="destination dir for the model to write out results")
+    parser.add_argument("-i", '--input_dir', required=True,  help="path to the input data for the model to read")
+    parser.add_argument("-o", '--output_dir', required=True,  help="destination dir for the model to write out results")
     args = parser.parse_args()
 
     ###########################################
-    # General reconfig
+    # General training reconfig
     ###########################################
-    cfg.gpu = args.gpu
-
     cfg.arch = args.arch
     cfg.DATA_TYPE = args.datatype
+    cfg.num_epochs = args.epochs
+    cfg.step_per_epoch = args.step_per_epoch if args.step_per_epoch > 0 else None
     cfg.batch_size = args.batch_size
-    cfg.test_batch = args.test_batch
-    cfg.vis_batch = args.vis_batch
-    cfg.analyse_batch = args.analyse_batch
     cfg.WORK_MODE = args.work_mode
+    cfg.optimiser = args.optimiser
     cfg.resume_epoch = args.resume_epoch
-    cfg.output_dir_name = args.output_name
     cfg.seed = args.seed
-
-    # model specs
+    cfg.lr_rate = args.lr_rate
     cfg.num_slots = args.num_slots
     cfg.temperature = args.temperature
     cfg.latent_dim = args.latent_dim
+    cfg.v_in_dim = args.view_dim
     cfg.view_dim = args.view_dim
     cfg.min_sample_views = args.min_sample_views
     cfg.max_sample_views = args.max_sample_views
     cfg.num_vq_show = args.num_vq_show
-    cfg.num_mc_samples = args.num_mc_samples
     cfg.pixel_sigma = args.pixel_sigma
+    cfg.use_mask = args.use_mask
+    cfg.use_bg = args.use_bg
     cfg.elbo_weights = {
         'kl_latent': args.kl_latent,
         'kl_spatial': args.kl_spatial,
@@ -385,75 +367,77 @@ def main(cfg):
         'exp_nll': args.exp_nll,
         'query_nll': args.query_nll
     }
-
     # I/O path configurations
     cfg.DATA_ROOT = args.input_dir
     cfg.ckpt_base = args.output_dir
 
-    # eval specs
-    cfg.use_bg = args.use_bg
+    ###########################################
+    # Config gpu usage
+    ###########################################
+    cfg.nodes = args.nodes
+    cfg.gpus = args.gpus
+    cfg.nrank = args.nrank
+    cfg.gpu_start = args.gpu_start
+    cfg.world_size = args.gpus * args.nodes  #
 
-    if args.eval_all:
-        cfg.eval_recon = True
-        cfg.eval_seg = True
-        cfg.eval_qry_obs = True
-        cfg.eval_qry_seg = True
-    else:
-        cfg.eval_recon = args.eval_recon
-        cfg.eval_seg = args.eval_seg
-        cfg.eval_qry_obs = args.eval_qry_obs
-        cfg.eval_qry_seg = args.eval_qry_seg
+    cfg = running_cfg(cfg)
 
-    if args.eval_dist:
-        cfg.eval_dist = True
-
-    if 'gqn' in cfg.arch.lower():
-        cfg.eval_seg = False
-
-    running_cfg(cfg)
-
-    # ---------- RUNNING EVALUATION ----------
-    eval_scores = run_evaluation(cfg)
-
-    print("\n =========== Model '{}' Evaluated on '{}' dataset =========== \n".format(cfg.arch, cfg.DATA_TYPE))
-
-    # print evaluation form
-    if args.eval_all:
-        # Recomposition
-        print('\n  <Reconstruction>:')
-        print('   -Rec_RMSE:    {}'.format(eval_scores['rmse_rec']))
-
-        # Observation querying
-        print('\n  <Querying observation>:')
-        print('   -Qry_RMSE:    {}'.format(eval_scores['rmse_qry']))
-
-        # Segmentation
-        print('\n  <Segmentation>:')
-        print('   -Seg_mIoU:     {}'.format(eval_scores['miou_seg']))
-
-        # Segmentation querying
-        print('\n  <Querying segmentation>:')
-        print('   -Query_mIoU:   {}'.format(eval_scores['miou_qry']))
-    else:
-        if cfg.eval_recon:
-            print('\n  <Reconstruction>:')
-            print('   -Rec_RMSE:    {}'.format(eval_scores['rmse_rec']))
-        if cfg.eval_qry_obs:
-            print('\n  <Querying observation>:')
-            print('   -Query_RMSE:    {}'.format(eval_scores['rmse_qry']))
-        if cfg.eval_seg:
-            print('\n  <Segmentation>:')
-            print('   -Seg_mIoU:     {}'.format(eval_scores['miou_seg']))
-        if cfg.eval_qry_seg:
-            print('\n  <Querying segmentation>:')
-            print('   -Query_mIoU:     {}'.format(eval_scores['miou_qry']))
-
-    if args.eval_dist:
-        print("  check the saved latent codes here:\n     {}".format(os.path.join(cfg.output_dir, 'latents')))
-        print("  configure https://github.com/cianeastwood/qedr.git for disentanglement quantification.")
-
-    print('\n ===============================================')
-    print('  EVALUATION FINISHED\n\n')
+    with open(args.path_config) as f:
+        config = yaml.safe_load(f)
+    for key, val in args.__dict__.items():
+        if key not in config or val is not None:
+            config[key] = val
+    if config['debug']:
+        config['ckpt_intvl'] = 1
+    if config['resume']:
+        config['train'] = True
+    if config['timestamp'] is None:
+        config['timestamp'] = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+    if config['use_timestamp']:
+        for key in ['folder_log', 'folder_out']:
+            config[key] = os.path.join(config[key], config['timestamp'])
+    data_loaders, image_shape = get_data_loaders(config)
+    config['image_shape'] = image_shape
+    model = MulMON(cfg).cuda()
+    path_model = os.path.join(config['folder_out'], config['file_model'])
+    model.load_state_dict(torch.load(path_model))
+    model.train(False)
+    def get_path_detail():
+        return os.path.join(config['folder_out'], '{}_{}.h5'.format(phase, num_views))
+    phase_list = [n for n in config['phase_param'] if n not in ['train', 'valid']]
+    for phase in phase_list:
+        phase_param = config['phase_param'][phase]
+        data_key = phase_param['key'] if 'key' in phase_param else phase
+        for num_views in [1, 2, 4, 8]:
+            phase_param['num_views'] = num_views
+            model.K = phase_param['num_slots']
+            path_detail = get_path_detail()
+            results_all = {}
+            for data in data_loaders[data_key]:
+                results = {}
+                for idx_run in range(config['num_tests']):
+                    with torch.set_grad_enabled(True):
+                        _, sub_results, _ = model(data, phase_param, require_results=True, deterministic_data=True)
+                    for key, val in sub_results.items():
+                        if key in ['image']:
+                            continue
+                        val = val.data.cpu().numpy()
+                        if key in ['recon', 'logits_mask', 'mask', 'apc']:
+                            val = np.moveaxis(val, -3, -1)
+                        if key in results:
+                            results[key].append(val)
+                        else:
+                            results[key] = [val]
+                for key, val in results.items():
+                    val = np.stack(val)
+                    if key in results_all:
+                        results_all[key].append(val)
+                    else:
+                        results_all[key] = [val]
+            with h5py.File(path_detail, 'w') as f:
+                for key, val in results_all.items():
+                    f.create_dataset(key, data=np.concatenate(val, axis=1), compression='gzip')
+    return
 
 
 ##############################################################################

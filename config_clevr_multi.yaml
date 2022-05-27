@@ -1,0 +1,20 @@
+ckpt_intvl: 1000
+save_intvl: 50
+summ_image_count: 2
+
+phase_param:
+  train:
+    num_views: 4
+    num_slots: 8
+  valid:
+    num_views: 4
+    num_slots: 8
+  test:
+    num_views: 4
+    num_slots: 8
+  general:
+    num_views: 4
+    num_slots: 12
+
+num_steps: 600000
+num_tests: 5

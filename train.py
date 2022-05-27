@@ -6,8 +6,16 @@ Training MulMON on a single GPU.
 import sys
 import os
 import argparse
+import datetime
+import h5py
+import matplotlib.pyplot as plt
+import numpy as np
 import random
 import torch
+import torch.utils.data as utils_data
+import yaml
+from models.mulmon import MulMON
+from torch.utils.tensorboard import SummaryWriter
 
 # set project search path
 ROOT_DIR = os.path.abspath("./")
@@ -21,57 +29,6 @@ from utils import set_random_seed, load_trained_mp, ensure_dir
 
 # ------------------------- important specs ------------------------
 def running_cfg(cfg):
-    ###########################################
-    # Config i/o path
-    ###########################################
-    if cfg.DATA_TYPE == 'gqn_jaco':
-        image_size = [64, 64]
-        CLASSES = ['_background_', 'jaco', 'generic']
-        cfg.v_in_dim = 7
-        cfg.max_sample_views = 6
-        data_dir = cfg.DATA_ROOT
-        assert os.path.exists(data_dir)
-        train_data_filename = os.path.join(data_dir, 'gqn_jaco', 'gqn_jaco_train.h5')
-        test_data_filename = os.path.join(data_dir, 'gqn_jaco', 'gqn_jaco_test.h5')
-        assert os.path.isfile(train_data_filename)
-        assert os.path.isfile(test_data_filename)
-    elif cfg.DATA_TYPE == 'clevr_mv':
-        image_size = [64, 64]
-        CLASSES = ['_background_', 'cube', 'sphere', 'cylinder']
-        cfg.v_in_dim = 3
-        cfg.max_sample_views = 6
-        data_dir = cfg.DATA_ROOT
-        assert os.path.exists(data_dir)
-        train_data_filename = os.path.join(data_dir, 'clevr_mv', 'clevr_mv_train.json')
-        test_data_filename = os.path.join(data_dir, 'clevr_mv', 'clevr_mv_test.json')
-        assert os.path.isfile(train_data_filename)
-        assert os.path.isfile(test_data_filename)
-    elif cfg.DATA_TYPE == 'clevr_aug':
-        image_size = [64, 64]
-        CLASSES = ['_background_', 'diamond', 'duck', 'mug', 'horse', 'dolphin']
-        cfg.v_in_dim = 3
-        cfg.max_sample_views = 6
-        data_dir = cfg.DATA_ROOT
-        assert os.path.exists(data_dir)
-        train_data_filename = os.path.join(data_dir, 'clevr_aug', 'clevr_aug_train.json')
-        test_data_filename = os.path.join(data_dir, 'clevr_aug', 'clevr_aug_test.json')
-        assert os.path.isfile(train_data_filename)
-        assert os.path.isfile(test_data_filename)
-    # ------------------- For your customised CLEVR -----------------------
-    elif cfg.DATA_TYPE == 'your-clevr':
-        image_size = [64, 64]
-        CLASSES = ['_background_', 'xxx']
-        cfg.v_in_dim = 3
-        cfg.max_sample_views = 6
-        data_dir = cfg.DATA_ROOT
-        assert os.path.exists(data_dir)
-        train_data_filename = os.path.join(data_dir, 'your-clevr', 'your-clevr_train.json')
-        test_data_filename = os.path.join(data_dir, 'your-clevr', 'your-clevr_test.json')
-        assert os.path.isfile(train_data_filename)
-        assert os.path.isfile(test_data_filename)
-    # ------------------- For your customised CLEVR -----------------------
-    else:
-        raise NotImplementedError
 
     cfg.view_dim = cfg.v_in_dim
 
@@ -103,17 +60,12 @@ def running_cfg(cfg):
         assert os.path.isfile(resume_path)
         cfg.resume_path = resume_path
 
-    cfg.DATA_DIR = data_dir
-    cfg.train_data_filename = train_data_filename
-    cfg.test_data_filename = test_data_filename
     cfg.check_dir = check_dir
     cfg.save_dir = save_dir
     cfg.vis_train_dir = vis_train_dir
     cfg.generated_dir = generated_dir
 
-    cfg.image_size = image_size
-    cfg.CLASSES = CLASSES
-    cfg.num_classes = len(CLASSES)
+    cfg.image_size = [64, 64]
 
     return cfg
 
@@ -201,8 +153,144 @@ def train(gpu_id, CFG):
     trainer.train()
 
 
+class Dataset(utils_data.Dataset):
+
+    def __init__(self, data, data_view):
+        super(Dataset, self).__init__()
+        self.images = torch.tensor(data['image'])
+        self.segments = torch.tensor(data['segment'])
+        self.overlaps = torch.tensor(data['overlap'])
+        self.viewpoints = torch.tensor(data_view)
+        if self.images.ndim == 4 and self.segments.ndim == 3 and self.overlaps.ndim == 3:
+            self.images = self.images[:, None]
+            self.segments = self.segments[:, None]
+            self.overlaps = self.overlaps[:, None]
+            self.viewpoints = self.viewpoints[:, None]
+        assert self.images.ndim == 5
+        assert self.segments.ndim == 4
+        assert self.overlaps.ndim == 4
+        assert self.viewpoints.ndim == 3
+
+    def __getitem__(self, idx):
+        image = self.images[idx]
+        segment = self.segments[idx]
+        overlap = self.overlaps[idx]
+        viewpoint = self.viewpoints[idx]
+        data = {'image': image, 'segment': segment, 'overlap': overlap, 'viewpoint': viewpoint}
+        return data
+
+    def __len__(self):
+        return self.images.shape[0]
+
+
+def get_data_loaders(config):
+    image_shape = None
+    datasets = {}
+    with h5py.File(config['path_data'], 'r', libver='latest', swmr=True) as f, \
+            h5py.File(config['path_viewpoint'], 'r', libver='latest', swmr=True) as f_view:
+        phase_list = [*f.keys()]
+        if not config['train']:
+            phase_list = [val for val in phase_list if val not in ['train', 'valid']]
+        index_sel = slice(config['batch_size']) if config['debug'] else ()
+        for phase in phase_list:
+            data = {key: f[phase][key][index_sel] for key in f[phase] if key not in ['layers', 'masks']}
+            data['image'] = np.moveaxis(data['image'], -1, -3)
+            if image_shape is None:
+                image_shape = data['image'].shape[-3:]
+            else:
+                assert image_shape == data['image'].shape[-3:]
+            data_view = f_view[phase]['viewpoint'][index_sel]
+            datasets[phase] = Dataset(data, data_view)
+    if 'train' in datasets and 'valid' not in datasets:
+        datasets['valid'] = datasets['train']
+    data_loaders = {}
+    for key, val in datasets.items():
+        data_loaders[key] = utils_data.DataLoader(
+            val,
+            batch_size=config['batch_size'],
+            num_workers=1,
+            shuffle=(key == 'train'),
+            drop_last=(key == 'train'),
+            pin_memory=True,
+        )
+    return data_loaders, image_shape
+
+
+def add_scalars(writer, metrics, losses, step, phase):
+    for key, val in metrics.items():
+        writer.add_scalar('{}/metric_{}'.format(phase, key), val, global_step=step)
+    for key, val in losses.items():
+        writer.add_scalar('{}/loss_{}'.format(phase, key), val, global_step=step)
+    return
+
+
+def compute_overview(config, results, dpi=100):
+    def convert_image(image):
+        image = np.moveaxis(image, 0, 2)
+        if image.shape[2] == 1:
+            image = np.repeat(image, 3, axis=2)
+        return image
+    def plot_image(ax, image, xlabel=None, ylabel=None, color=None):
+        plot = ax.imshow(image, interpolation='bilinear')
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_xlabel(xlabel, color='k' if color is None else color, fontfamily='monospace') if xlabel else None
+        ax.set_ylabel(ylabel, color='k' if color is None else color, fontfamily='monospace') if ylabel else None
+        ax.xaxis.set_label_position('top')
+        return plot
+    def get_overview(fig_idx):
+        image = results_sel['image'][fig_idx]
+        recon = results_sel['recon'][fig_idx]
+        apc = results_sel['apc'][fig_idx]
+        mask = results_sel['mask'][fig_idx]
+        pres = results_sel['pres'][fig_idx]
+        num_views, num_slots = apc.shape[:2]
+        rows, cols = 2 * num_views, num_slots + 1
+        fig, axes = plt.subplots(rows, cols, figsize=(cols, rows + 0.2), dpi=dpi)
+        for idx_v in range(num_views):
+            plot_image(axes[idx_v * 2, 0], convert_image(image[idx_v]), xlabel='scene' if idx_v == 0 else None)
+            plot_image(axes[idx_v * 2 + 1, 0], convert_image(recon[idx_v]))
+            for idx_s in range(num_slots):
+                xlabel = 'obj_{}'.format(idx_s) if idx_s < num_slots - 1 else 'back'
+                xlabel = xlabel if idx_v == 0 else None
+                color = [1.0, 0.5, 0.0] if pres[idx_s] >= 128 else [0.0, 0.5, 1.0]
+                plot_image(axes[idx_v * 2, idx_s + 1], convert_image(apc[idx_v, idx_s]), xlabel=xlabel, color=color)
+                plot_image(axes[idx_v * 2 + 1, idx_s + 1], convert_image(mask[idx_v, idx_s]))
+        fig.tight_layout(pad=0)
+        fig.canvas.draw()
+        width, height = fig.canvas.get_width_height()
+        out = np.frombuffer(fig.canvas.tostring_rgb(), dtype='uint8').reshape(height, width, -1)
+        plt.close(fig)
+        return out
+    summ_image_count = min(config['summ_image_count'], config['batch_size'])
+    results_sel = {key: val[:summ_image_count].data.cpu().numpy() for key, val in results.items()}
+    overview_list = [get_overview(idx) for idx in range(summ_image_count)]
+    overview = np.concatenate(overview_list, axis=0)
+    overview = np.moveaxis(overview, 2, 0)
+    return overview
+
+
+def add_overviews(config, writer, results, step, phase):
+    overview = compute_overview(config, results)
+    writer.add_image(phase, overview, global_step=step)
+    return
+
+
 def main(cfg):
     parser = argparse.ArgumentParser()
+    parser.add_argument('--path_config')
+    parser.add_argument('--path_data')
+    parser.add_argument('--path_viewpoint')
+    parser.add_argument('--folder_log')
+    parser.add_argument('--folder_out')
+    parser.add_argument('--timestamp')
+    parser.add_argument('--num_tests', type=int)
+    parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--train', action='store_true')
+    parser.add_argument('--resume', action='store_true')
+    parser.add_argument('--use_timestamp', action='store_true')
+    parser.add_argument('--file_ckpt', default='ckpt.pth')
+    parser.add_argument('--file_model', default='model.pth')
     parser.add_argument('--arch', type=str, default='ScnModel',
                         help="model name")
     parser.add_argument('--datatype', type=str, default='clevr',
@@ -264,6 +352,7 @@ def main(cfg):
     cfg.num_slots = args.num_slots
     cfg.temperature = args.temperature
     cfg.latent_dim = args.latent_dim
+    cfg.v_in_dim = args.view_dim
     cfg.view_dim = args.view_dim
     cfg.min_sample_views = args.min_sample_views
     cfg.max_sample_views = args.max_sample_views
@@ -293,10 +382,141 @@ def main(cfg):
 
     cfg = running_cfg(cfg)
 
-    # # save current config for later evaluation
-    # utils.write_pickle(cfg, os.path.join(cfg.check_dir, 'config.obj'))
-
-    train(cfg.gpu_start, cfg)
+    with open(args.path_config) as f:
+        config = yaml.safe_load(f)
+    for key, val in args.__dict__.items():
+        if key not in config or val is not None:
+            config[key] = val
+    if config['debug']:
+        config['ckpt_intvl'] = 1
+    if config['resume']:
+        config['train'] = True
+    if config['timestamp'] is None:
+        config['timestamp'] = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+    if config['use_timestamp']:
+        for key in ['folder_log', 'folder_out']:
+            config[key] = os.path.join(config[key], config['timestamp'])
+    if config['train'] and not config['resume']:
+        for key in ['folder_log', 'folder_out']:
+            if os.path.exists(config[key]):
+                raise FileExistsError(config[key])
+            os.makedirs(config[key])
+        with open(os.path.join(config['folder_out'], 'config.yaml'), 'w') as f:
+            yaml.safe_dump(config, f)
+    data_loaders, image_shape = get_data_loaders(config)
+    config['image_shape'] = image_shape
+    model = MulMON(cfg).cuda()
+    params_to_update = get_trainable_params(model)
+    optimizer = torch.optim.Adam(params_to_update,
+                                 lr=cfg.lr_rate,
+                                 weight_decay=cfg.weight_decay)
+    scheduler = AnnealingStepLR(optimizer, mu_i=cfg.lr_rate, mu_f=0.1 * cfg.lr_rate, n=1e6)
+    def data_loader_train():
+        while True:
+            for x in data_loaders['train']:
+                yield x
+    data_loader_valid = data_loaders['valid']
+    phase_param_train = config['phase_param']['train']
+    phase_param_valid = config['phase_param']['valid']
+    path_ckpt = os.path.join(config['folder_out'], config['file_ckpt'])
+    path_model = os.path.join(config['folder_out'], config['file_model'])
+    if config['resume']:
+        checkpoint = torch.load(path_ckpt)
+        step = checkpoint['step']
+        best_step = checkpoint['best_step']
+        best_loss = checkpoint['best_loss']
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        print('Resume training from step {}'.format(step))
+    else:
+        step = 0
+        best_step = -1
+        best_loss = float('inf')
+        print('Start training')
+    print()
+    with SummaryWriter(log_dir=config['folder_log'], purge_step=step + 1) as writer:
+        for data_train in data_loader_train():
+            step += 1
+            if step > config['num_steps']:
+                break
+            model.train(True)
+            model.K = phase_param_train['num_slots']
+            with torch.set_grad_enabled(True):
+                losses, _, metrics = model(data_train, phase_param_train, require_results=False)
+            metrics = {key: val.mean() for key, val in metrics.items()}
+            add_scalars(writer, metrics, losses, step, 'train')
+            loss_opt = sum(loss for loss in losses.values())
+            optimizer.zero_grad()
+            loss_opt.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            optimizer.step()
+            scheduler.step()
+            if step % config['ckpt_intvl'] == 0:
+                with torch.set_grad_enabled(True):
+                    losses, results, metrics = model(data_train, phase_param_train)
+                add_overviews(config, writer, results, step, 'train')
+                model.train(False)
+                model.K = phase_param_valid['num_slots']
+                sum_metrics, sum_losses = {}, {}
+                num_data = 0
+                for idx_batch, data_valid in enumerate(data_loader_valid):
+                    require_results = idx_batch == 0
+                    batch_size = data_valid['image'].shape[0]
+                    with torch.set_grad_enabled(True):
+                        losses, results, metrics = model(
+                            data_valid, phase_param_valid, require_results=require_results, deterministic_data=True)
+                    if require_results:
+                        add_overviews(config, writer, results, step, 'valid')
+                    losses['compare'] = sum(loss for loss in losses.values())
+                    for key, val in metrics.items():
+                        if key in sum_metrics:
+                            sum_metrics[key] += val.sum().item()
+                        else:
+                            sum_metrics[key] = val.sum().item()
+                    for key, val in losses.items():
+                        if key in sum_losses:
+                            sum_losses[key] += val.item() * batch_size
+                        else:
+                            sum_losses[key] = val.item() * batch_size
+                    num_data += batch_size
+                mean_metrics = {key: val / num_data for key, val in sum_metrics.items()}
+                mean_losses = {key: val / num_data for key, val in sum_losses.items()}
+                loss_compare = mean_losses['compare']
+                add_scalars(writer, mean_metrics, mean_losses, step, 'valid')
+                writer.flush()
+                if loss_compare < best_loss:
+                    best_loss = loss_compare
+                    best_step = step
+                    torch.save(model.state_dict(), path_model)
+                save_dict = {
+                    'step': step,
+                    'best_step': best_step,
+                    'best_loss': best_loss,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                }
+                torch.save(save_dict, path_ckpt)
+                idx_save = step // config['ckpt_intvl']
+                if idx_save % config['save_intvl'] == 0:
+                    name_save = 'save_{}.pth'.format(idx_save // config['save_intvl'])
+                    path_save = os.path.join(config['folder_out'], name_save)
+                    torch.save(save_dict, path_save)
+                print('Step: {}/{}'.format(step, config['num_steps']))
+                print((' ' * 4).join([
+                    'ARI_A_S: {:.3f}'.format(mean_metrics['ari_all_s']),
+                    'ARI_A_M: {:.3f}'.format(mean_metrics['ari_all_m']),
+                    'ARI_O_S: {:.3f}'.format(mean_metrics['ari_obj_s']),
+                    'ARI_O_M: {:.3f}'.format(mean_metrics['ari_obj_m']),
+                ]))
+                print((' ' * 4).join([
+                    'MSE: {:.2e}'.format(mean_metrics['mse']),
+                    'Count: {:.3f}'.format(mean_metrics['count']),
+                ]))
+                print('Best Step: {}'.format(best_step))
+                print()
+    return
 
 
 ##############################################################################

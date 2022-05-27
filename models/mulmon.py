@@ -10,6 +10,15 @@ import visualisation as vis
 import utils
 
 
+def select_by_index(x, index):
+    x_ndim = x.ndim
+    index_ndim = index.ndim
+    index = index.reshape(list(index.shape) + [1] * (x_ndim - index_ndim))
+    index = index.expand([-1] * index_ndim + list(x.shape[index_ndim:]))
+    x = torch.gather(x, index_ndim - 1, index)
+    return x
+
+
 class MulMON(nn.Module):
     """
     v1: object-centric GQN.
@@ -113,7 +122,7 @@ class MulMON(nn.Module):
             print(" -- {} generated scene samples have been saved".format(b + start_id + 1))
 
     @staticmethod
-    def sample_view_config(num_views, min_limit=5, max_limit=7, allow_repeat=False):
+    def sample_view_config(num_views, min_limit=5, max_limit=7, allow_repeat=False, full_data=False):
         """
         Select the views the scenes are observed from, also generate viewpoints for the querying
         :param num_views: (default depends on the data, e.g. 10) how many viewpoints are available, or reachable for the
@@ -123,14 +132,15 @@ class MulMON(nn.Module):
         :param allow_repeat: allow repeated viewpoints to be sampled
         :return: observation_view_id_list, querying_view_id_list
         """
-        assert max_limit <= num_views
+        if not full_data:
+            assert max_limit <= num_views
         FULL_HOUSE = [*range(num_views)]
         # randomise the order of views
-        random.shuffle(FULL_HOUSE)
+        # random.shuffle(FULL_HOUSE)
         # randomise the number of the given observations
         L = random.randint(min_limit, max_limit)
 
-        if L == num_views:
+        if full_data or L == num_views:
             return FULL_HOUSE, FULL_HOUSE
 
         # random partition of the observation views and query views
@@ -282,9 +292,35 @@ class MulMON(nn.Module):
         # var_obj = np.stack(var_obj, axis=0).var(axis=0, ddof=1).sum(2)
         return var_x, None    # var_obj
 
-    def forward(self, images, targets, std=None):
-        xmul = torch.stack(images, dim=0)  # [B, V, C, H, W]
-        v_pts = torch.stack([tar['view_points'] for tar in targets], dim=0).type(xmul.dtype)  # [B, V, 3]
+    @staticmethod
+    def convert_data(data, num_views, deterministic_data):
+        batch_size, data_views = data['image'].shape[:2]
+        device = data['image'].device
+        if deterministic_data:
+            index = torch.arange(data_views, device=device)[None].expand(batch_size, -1)
+        else:
+            noise = torch.rand([batch_size, data_views], device=device)
+            index = torch.argsort(noise, dim=1)
+        if num_views >= 0:
+            index = index[:, :num_views]
+        else:
+            index = index[:, num_views:]
+        data = {key: select_by_index(val, index) for key, val in data.items()}
+        image = data['image'].float() / 255
+        segment_base = data['segment'][:, :, None, None].long()
+        scatter_shape = [*segment_base.shape[:2], segment_base.max() + 1, *segment_base.shape[3:]]
+        segment = torch.zeros(scatter_shape, device=segment_base.device).scatter_(2, segment_base, 1)
+        overlap = torch.gt(data['overlap'][:, :, None, None], 1).float()
+        viewpoint = data['viewpoint']
+        return image, segment, overlap, viewpoint
+
+    def forward(self, data, phase_param, std=None, require_results=True, deterministic_data=False):
+        data = {key: val.cuda(non_blocking=True) for key, val in data.items()}
+        num_views = phase_param['num_views']
+        num_slots = phase_param['num_slots']
+        image, segment, overlap, viewpoint = self.convert_data(data, num_views, deterministic_data)
+        xmul = image  # [B, V, C, H, W]
+        v_pts = viewpoint  # [B, V, 3]
         # adding noise to viewpoint vectors helps to robustify the model:
         v_pts += 0.015*torch.randn_like(v_pts, dtype=xmul.dtype, device=xmul.device, requires_grad=False)
 
@@ -296,7 +332,7 @@ class MulMON(nn.Module):
 
         # Random partition of observation viewpoints and query viewpoints
         obs_view_idx, qry_view_idx = self.sample_view_config(V, self.min_num_views, self.max_num_views,
-                                                             allow_repeat='gqn' in self.config.DATA_TYPE)
+                                                             allow_repeat='gqn' in self.config.DATA_TYPE, full_data=deterministic_data)
 
         # Initialize parameters for the latents' distribution
         assert not torch.isnan(self.lmbda0).any().item(), 'lmbda0 has nan'
@@ -320,6 +356,8 @@ class MulMON(nn.Module):
             neg_elbo = neg_elbo + nelbo_v.mean() * ((float(venum) + 1) / float(len(obs_view_idx)))
 
         # --- scene querying phase --- #
+        image_list, segment_list, overlap_list = [], [], []
+        apc_list, mask_list, logits_mask_list = [], [], []
         for vqnum, vq in enumerate(qry_view_idx):
             x = xmul[:, vq, ...]
             yq = v_feat[:, :, vq, :]
@@ -339,11 +377,101 @@ class MulMON(nn.Module):
             nll = -1. * (ll_pxl.flatten(start_dim=1).sum(dim=-1).mean())
 
             xq_nll = xq_nll + nll.mean() * (1.0 / float(len(qry_view_idx)))
-
+            image_list.append(image[:, vq])
+            segment_list.append(segment[:, vq])
+            overlap_list.append(overlap[:, vq])
+            apc_list.append(mu_x)
+            mask_list.append(masks)
+            logits_mask_list.append(mask_logits)
+        image_qry = torch.stack(image_list, dim=1)
+        segment_qry = torch.stack(segment_list, dim=1)
+        overlap_qry = torch.stack(overlap_list, dim=1)
+        apc = torch.stack(apc_list, dim=1)
+        logits_mask = torch.stack(logits_mask_list, dim=1)
+        mask = torch.stack(mask_list, dim=1)
+        mask_oh = torch.argmax(mask, dim=2, keepdim=True)
+        mask_oh = torch.zeros_like(mask).scatter_(2, mask_oh, 1)
+        pres = mask_oh.reshape(*mask_oh.shape[:-3], -1).max(-1).values.max(-2).values
+        recon = (mask * apc).sum(-4)
+        results = {
+            'image': image_qry, 'segment': segment_qry, 'overlap': overlap_qry,
+            'recon': recon, 'apc': apc, 'logits_mask': logits_mask, 'mask': mask, 'mask_oh': mask_oh, 'pres': pres,
+        }
+        metrics = self.compute_metrics(results)
+        if require_results:
+            disc_key_list = ['image', 'recon', 'mask', 'apc', 'pres']
+            cont_key_list = ['logits_mask']
+            full_key_list = disc_key_list + cont_key_list
+            results = {key: val for key, val in results.items() if key in full_key_list}
+            for key, val in results.items():
+                if key in disc_key_list:
+                    results[key] = (val.clamp(0, 1) * 255).to(torch.uint8)
+        else:
+            results = {}
         loss_dict = AttrDict()
         loss_dict['neg_elbo'] = neg_elbo * discount_obs
         loss_dict['query_nll'] = xq_nll * self.config.elbo_weights['query_nll']
-        return loss_dict
+        return loss_dict, results, metrics
+
+    @staticmethod
+    def compute_ari(mask_true, mask_pred):
+        def comb2(x):
+            x = x * (x - 1)
+            if x.ndim > 1:
+                x = x.sum([*range(1, x.ndim)])
+            return x
+        mask_true = mask_true.reshape(*mask_true.shape[:2], -1)
+        mask_pred = mask_pred.reshape(*mask_pred.shape[:2], -1)
+        num_pixels = mask_true.sum([*range(1, mask_true.ndim)])
+        mask_true = mask_true.reshape([mask_true.shape[0], mask_true.shape[1], 1, mask_true.shape[-1]])
+        mask_pred = mask_pred.reshape([mask_pred.shape[0], 1, mask_pred.shape[1], mask_pred.shape[-1]])
+        mat = (mask_true * mask_pred).sum(-1)
+        sum_row = mat.sum(1)
+        sum_col = mat.sum(2)
+        comb_mat = comb2(mat)
+        comb_row = comb2(sum_row)
+        comb_col = comb2(sum_col)
+        comb_num = comb2(num_pixels)
+        comb_prod = (comb_row * comb_col) / comb_num
+        comb_mean = 0.5 * (comb_row + comb_col)
+        diff = comb_mean - comb_prod
+        score = (comb_mat - comb_prod) / diff
+        invalid = ((comb_num == 0) + (diff == 0)) > 0
+        score = torch.where(invalid, torch.ones_like(score), score)
+        return score
+
+    def compute_metrics(self, results):
+        def compute_ari_values(mask_true):
+            mask_true_s = mask_true.reshape(-1, *mask_true.shape[2:])
+            mask_true_m = mask_true.transpose(1, 2).contiguous()
+            mask_oh_s = mask_oh.reshape(-1, *mask_oh.shape[2:])
+            mask_oh_m = mask_oh.transpose(1, 2).contiguous()
+            ari_all_s = self.compute_ari(mask_true_s, mask_oh_s).reshape(batch_size, num_views).mean(1)
+            ari_all_m = self.compute_ari(mask_true_m, mask_oh_m)
+            return ari_all_s, ari_all_m
+        image = results['image']
+        segment = results['segment']
+        batch_size, num_views = image.shape[:2]
+        segment_obj = segment[:, :, :-1]
+        # ARI
+        segment_all_sel = segment
+        segment_obj_sel = segment_obj
+        mask_oh = results['mask_oh']
+        ari_all_s, ari_all_m = compute_ari_values(segment_all_sel)
+        ari_obj_s, ari_obj_m = compute_ari_values(segment_obj_sel)
+        # MSE
+        recon = results['recon']
+        mse = (recon - image).square().mean([*range(1, image.ndim)])
+        # Count
+        count_true = segment_obj.reshape(*segment_obj.shape[:-3], -1).max(-1).values.max(-2).values.sum(-1)
+        count_pred = results['pres'].sum(1) - 1
+        count_acc = torch.eq(count_true, count_pred).to(dtype=torch.float)
+        metrics = {
+            'ari_all_s': ari_all_s, 'ari_all_m': ari_all_m,
+            'ari_obj_s': ari_obj_s, 'ari_obj_m': ari_obj_m,
+            'mse': mse, 'count': count_acc,
+        }
+        return metrics
 
     @torch.enable_grad()
     def predict(self, images, targets,
